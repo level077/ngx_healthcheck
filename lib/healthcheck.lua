@@ -20,7 +20,7 @@ local spawn = ngx.thread.spawn
 local wait = ngx.thread.wait
 
 local _M = {
-    _VERSION = '0.01'
+    _VERSION = '0.02'
 }
 
 if not ngx.config
@@ -36,7 +36,7 @@ if not ok then
 end
 
 local ok, new_tab = pcall(require, "table.new")
-if not ok then
+if not ok or type(new_tab) ~= "function" then
     new_tab = function (narr, nrec) return {} end
 end
 
@@ -205,7 +205,7 @@ local function check_peer(ctx, id, peer, is_backup)
     local name = peer.name
     local statuses = ctx.statuses
     local req = ctx.http_req
-    local valid_response = ctx.valid_response
+    local response = ctx.response
 
     local sock, err = stream_sock()
     if not sock then
@@ -220,7 +220,7 @@ local function check_peer(ctx, id, peer, is_backup)
         ok, err = sock:connect(peer.host, peer.port)
     else
         ok, err = sock:connect(name)
-    end 
+    end
     if not ok then
         if not peer.down then
             errlog("failed to connect to ", name, ": ", err)
@@ -233,18 +233,52 @@ local function check_peer(ctx, id, peer, is_backup)
                 errlog("failed to send request to ", name, ": ", err)
             end
             peer_fail(ctx, is_backup, id, peer)
-        else
-	    local response = "\r\n\r\n" .. valid_response 
-            local reader = sock:receiveuntil(response)
-            local response, err = reader()
-            if not response then
+        elseif response then
+	    local reader = sock:receiveuntil(response)
+            local data, err = reader()
+            if not data then
                 if not peer.down then
-                    errlog("failed to receive response line from ", 
+                    errlog("failed to receive response line from ",
                            ": ", err)
                 end
                 peer_fail(ctx, is_backup, id, peer)
             else
                 peer_ok(ctx, is_backup, id, peer)
+            end
+	else
+            local status_line, err = sock:receive()
+            if not status_line then
+                if not peer.down then
+                    errlog("failed to receive status line from ", name,
+                           ": ", err)
+                end
+                peer_fail(ctx, is_backup, id, peer)
+            else
+                if statuses then
+                    local from, to, err = re_find(status_line,
+                                                  [[^HTTP/\d+\.\d+\s+(\d+)]],
+                                                  "joi", nil, 1)
+                    if not from then
+                        if not peer.down then
+                            errlog("bad status line from ", name, ": ",
+                                   status_line)
+                        end
+                        peer_fail(ctx, is_backup, id, peer)
+                    else
+                        local status = tonumber(sub(status_line, from, to))
+                        if not statuses[status] then
+                            if not peer.down then
+                                errlog("bad status code from ",
+                                       name, ": ", status)
+                            end
+                            peer_fail(ctx, is_backup, id, peer)
+                        else
+                            peer_ok(ctx, is_backup, id, peer)
+                        end
+                    end
+                else
+                    peer_ok(ctx, is_backup, id, peer)
+                end
             end
             sock:close()
         end
@@ -441,6 +475,7 @@ local function do_check(ctx)
         check_peers(ctx, ctx.backup_peers, true)
         release_lock(ctx)
     end
+
     if ctx.new_version then
         local key = "v:" .. ctx.upstream
         local dict = ctx.dict
@@ -466,12 +501,11 @@ check = function (premature, ctx)
         return
     end
 
-    --local ok, err = pcall(do_check, ctx)
-    --if not ok then
-    --    errlog("failed to run healthcheck cycle: ", err)
-    --end
+    local ok, err = pcall(do_check, ctx)
+    if not ok then
+        errlog("failed to run healthcheck cycle: ", err)
+    end
 
-    do_check(ctx)
     local ok, err = new_timer(ctx.interval, check, ctx)
     if not ok then
         if err ~= "process exiting" then
@@ -534,10 +568,7 @@ function _M.spawn_checker(opts)
         end
     end
 
-    local valid_response = opts.valid_response
-    if not valid_response then
-	return nil,"\"valid_response\" option required"	
-    end
+    local response = opts.valid_response
 
     -- debug("interval: ", interval)
 
@@ -592,7 +623,7 @@ function _M.spawn_checker(opts)
         fall = fall,
         rise = rise,
         statuses = statuses,
-	valid_response = valid_response,
+	response = response,
         version = 0,
         concurrency = concur,
     }
